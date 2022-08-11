@@ -1,0 +1,2465 @@
+; ============================================================================
+; Copyright 2022 S. V. Nickolas.
+;
+; Permission is hereby granted, free of charge, to any person obtaining a copy
+; of this  software and  associated  documentation  files (the "Software"), to
+; deal in  the Software without restriction, including without  limitation the
+; rights to  use, copy, modify, merge, publish, distribute, sublicense, and/or
+; sell copies of  the Software, and to permit persons to  whom the Software is
+; furnished to do so, subject to the following condition:  The above copyright
+; notice  and this  permission  notice  shall be  included in  all  copies  or
+; substantial portions of this Software.
+;
+; THIS SOFTWARE IS  PROVIDED BY THE AUTHOR "AS IS" AND  ANY EXPRESS OR IMPLIED
+; WARRANTIES,  INCLUDING, BUT  NOT  LIMITED  TO,  THE  IMPLIED  WARRANTIES  OF
+; MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE, ARE DISCLAIMED.  IN NO
+; EVENT SHALL  THE AUTHOR  BE  LIABLE  FOR  ANY  DIRECT, INDIRECT, INCIDENTAL,
+; SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+; PROCUREMENT OF SUBSTITUTE  GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+; OR BUSINESS  INTERRUPTION) HOWEVER  CAUSED  AND ON ANY  THEORY OF LIABILITY,
+; WHETHER  IN  CONTRACT, STRICT  LIABILITY, OR  TORT (INCLUDING  NEGLIGENCE OR
+; OTHERWISE) ARISING  IN ANY WAY  OUT OF  THE  USE OF  THIS  SOFTWARE, EVEN IF
+; ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+; ============================================================================
+
+; ============================================================================
+; The CPU core and hardware emulation are not yet complete.
+;
+; This program is intended to provide the most rudimentary possible Apple ][
+; emulation, in order to run as fast as possible on an 8086.  The use of
+; macro pseudofunction ops is effectively a matter of "unrolling loops".
+;
+; My intention for writing this emulator is related to the P86 project:  An
+; operating system with no software is useless, so I needed to implement a
+; basic emulator to run under P86 in order to allow at least a limited amount
+; of ProDOS-8 applications to be used.  I am using the "Divide and Conquer"
+; method to build this - this is the first stage, the emulator without the
+; ProDOS hooks.
+;
+; The file "APPLE.ROM" is required and must be a 12K Apple ][/][+ ROM dump
+; (the 50 sector FPBASIC file from the 1980 DOS 3.3 system master is used for
+; testing).  It is not supplied for reasons that should be obvious.
+; ============================================================================
+
+; ============================================================================
+; -DCPUDEBUG: Outputs the instruction pointer in hex to PRN: before every
+;             65C02 operation.  (Used to debug the CPU core; will be removed)
+; -DNOBSS:    Bind trailing 00s into the binary; default is not to do so, 
+;             except the NUL terminator of the ROM filename.  (Used to aid in
+;             debugging the CPU core; will be removed)
+; -DOPTSIZE:  Builds an alternative version of the CPU core that does not
+;             unroll most operations; slower but significantly smaller.
+;
+; Note that testing is generally done with NOBSS and OPTSIZE switched OFF.
+; ============================================================================
+
+          cpu       8086
+          org       0x0100
+
+; ============================================================================
+; Important to put this first
+; ============================================================================
+
+stksiz    equ       1024
+
+; ============================================================================
+; Common to the debug modes
+; ============================================================================
+
+%ifdef    CPUDEBUG
+%define   XTRACODE
+%endif
+
+%ifdef    MEMDEBUG
+%define   XTRACODE
+%endif
+
+; ============================================================================
+; How to route debugging information if debugging is set.
+; ============================================================================
+
+iocmd     equ       0x02                ; 2=STDOUT, 5=STDPRN
+
+; ============================================================================
+; 65C02 processor flag bits
+; ============================================================================
+
+FLAG_C    equ       0x01                ; Carry bit
+FLAG_Z    equ       0x02                ; Zero bit
+FLAG_I    equ       0x04                ; Interrupt bit
+FLAG_D    equ       0x08                ; Decimal bit
+FLAG_B    equ       0x10                ; Break bit
+FLAG_R    equ       0x20                ; Always on
+FLAG_V    equ       0x40                ; Overflow bit
+FLAG_N    equ       0x80                ; Negative bit
+
+; ============================================================================
+; Startup code - pretty bogstock stuff
+; ============================================================================
+
+entry:    mov       ah, 0x30            ; DOS version
+          int       0x21
+          cmp       al, 0x02            ; 2.0 or later?
+          jae       .1                  ; Yes, so keep going.
+          mov       dx, edos1           ; Display error.
+          mov       ah, 0x09
+          int       0x21
+          int       0x20                ; DOS 1 EXIT
+
+.1:       mov       sp, tail            ; Move stack to where we know it will
+                                        ; be safe after we shrink our memory
+                                        ; allocation.
+          mov       bp, comstack        ; Stack limit
+          push      cs                  ; Free all extra memory.
+          pop       es
+          mov       bx, tail
+          mov       cl, 4
+          shr       bx, cl
+          inc       bx
+          mov       ah, 0x4A            ; REALLOC
+          int       0x21
+          jc        .2
+          mov       bx, 0x1000          ; Reserve ourselves 64K.
+          mov       ah, 0x48            ; MALLOC
+          int       0x21
+          jnc       .4
+.2:       mov       dx, eram            ; Fatal error - not enough memory.
+.3:       mov       ah, 0x09
+          int       0x21
+          mov       ax, 0x4C01
+          int       0x21                ; EXIT CODE 1
+
+; ----------------------------------------------------------------------------
+; Read APPLE.ROM into memory, with some sanity checks.
+; ----------------------------------------------------------------------------
+
+.4:       mov       [emuseg], ax        ; Save segment of the block we got
+          mov       ax, 0x3D00          ; OPEN
+          mov       dx, romfile         ; This code is not provided, see above
+          int       0x21
+          jnc       .6
+.5:       mov       dx, erom            ; Fatal error - can't open ROM.
+          push      cs                  ; We will sometimes be invoked from
+          pop       ds                  ; points in the code where DS != CS,
+                                        ; so fix that before calling DOS.
+          jmp short .3                  ; Die screaming.
+
+.6:       mov       bx, ax              ; File handle
+          mov       ax, 0x4202          ; LSEEK(SEEK_END)
+          xor       cx, cx              ; High word of DWORD: 0
+          xor       dx, dx              ; Low word of DWORD: 0
+          int       0x21
+          or        dx, dx              ; >=65536: fail
+          jz        .8
+.7:       mov       dx, esize           ; Fatal error - invalid ROM size.
+          jmp short .3
+.8:       cmp       ax, 0x3000          ; !=12288: fail
+          jne       .7
+          xor       cx, cx              ; DX is already 0.
+          mov       ax, 0x4200          ; LSEEK(SEEK_SET)
+          int       0x21
+          jc        .5
+          mov       ah, 0x3F            ; READ
+          mov       cx, 0x3000          ; 12288 bytes
+          mov       ds, [emuseg]
+          mov       dx, 0xD000          ; Location of ROM in 65C02 space
+          int       0x21
+          jc        .5
+          push      cs                  ; Restore data segment (DS=CS)
+          pop       ds
+          mov       ah, 0x3E            ; CLOSE
+          int       0x21
+          mov       es, [emuseg]        ; Set extra segment to our 64K block
+
+; ----------------------------------------------------------------------------
+; Set video mode to something that best approximates the Apple ][.
+; ----------------------------------------------------------------------------
+
+          mov       ax, 0x0001          ; MODE C040
+          int       0x10
+          mov       ax, 0x0101          ; Some 386 BIOSes will bork if AL !=
+          mov       cx, 0x2000          ;   video mode, so set that.  CH=20
+          int       0x10                ;   should hide the cursor.
+
+          call      vgasetup
+          mov       ah, [statmain]      ; White on magenta
+          mov       si, statmsg         ; Copy status bar
+          mov       di, 0x0780
+          mov       dx, 0xB800
+          mov       ds, dx
+.9:       mov       al, cs:[si]
+          or        al, al
+          jz        .10
+          mov       [di], ax
+          inc       si
+          inc       di
+          inc       di
+          jmp short .9
+.10:      push      cs
+          pop       ds
+
+; ----------------------------------------------------------------------------
+; Set up the emulation.
+; ----------------------------------------------------------------------------
+
+          xor       di, di              ; Flush RAM.  Using postwrt also
+.11:      mov       byte es:[di], 0     ; forces the writes to the text memory
+          cmp       di, 0x0400          ; to be updated (creating the
+          jb        .12                 ; characteristic inverted @s).
+          cmp       di, 0x0800
+          jae       .12
+          push      di 
+          call      postwrt
+          pop       di
+.12:      inc       di
+          cmp       di, 0xC000
+          jb        .11
+
+; ----------------------------------------------------------------------------
+; Reset the emulated 65C02.
+; ----------------------------------------------------------------------------
+
+          call      cpureset
+
+; ----------------------------------------------------------------------------
+; This event loop will be replaced once the CPU core is known to be functional
+; (it is currently extremely buggy).
+; ----------------------------------------------------------------------------
+
+cpuloop:  
+%ifdef    CPUDEBUG
+          call      cpudebug
+%endif
+          call      cpustep             ; Run a single 65C02 operation.
+
+          mov       ah, 0x01
+          int       0x16
+          jz        cpuloop
+          xor       ah, ah
+          int       0x16
+          or        al, al
+          jnz       .5
+          cmp       ah, 0x43            ; F9
+          je        .8
+          cmp       ah, 0x44            ; F10 - exit
+          je        .9
+          cmp       ah, 0x48            ; Up
+          je        .1
+          cmp       ah, 0x4B            ; Left
+          je        .2
+          cmp       ah, 0x4D            ; Right
+          je        .3
+          cmp       ah, 0x50            ; Down
+          je        .4
+          jmp short cpuloop
+.1:       mov       al, 0x0B
+          jmp short .7
+.2:       mov       al, 0x08
+          jmp short .7
+.3:       mov       al, 0x15
+          jmp short .7
+.4:       mov       al, 0x0A            ; FALL THROUGH
+.5:       cmp       al, 'A'             ; Flip case
+          jb        .7                  ; <A do not touch
+          cmp       al, 'z'             ; >z do not touch
+          ja        .7
+          cmp       al, 'a'             ; a-z flip
+          jae       .6
+          cmp       al, 'Z'             ; A-Z flip
+          ja        .7
+.6:       xor       al, 0x20
+.7:       or        al, 0x80
+          mov       [lastkey], al
+          jmp short cpuloop
+.8:       call      cpureset
+          jmp short cpuloop
+.9:       mov       ax, 0x0003          ; MODE CO80
+          int       0x10
+          
+          mov       ax, 0x4C00
+          int       0x21                ; EXIT CODE 0
+
+; ----------------------------------------------------------------------------
+; Initialize a VGA, if found.
+; ----------------------------------------------------------------------------
+
+vgasetup: mov       ax, 0x1A00          ; VGA?
+          int       0x10
+          cmp       al, 0x1A
+          je        .1
+          mov       byte [isvga], 0x00
+          mov       byte [statmain], 0x5F
+          mov       word [colmain], 0x7007
+          ret
+.1:       mov       ax, 0x1003          ; Disable blink
+          xor       bx, bx
+          int       0x10
+          mov       byte [isvga], 0xFF
+          mov       byte [statmain], 0x3F
+          mov       word [colmain], 0xF00F
+          xor       cl, cl
+          mov       si, vgamap
+.2:       mov       bl, cl
+          xor       bh, bh
+          mov       [colmap+bx], cl
+          mov       dx, 0x03C8
+          mov       al, cl
+          out       dx, al
+          inc       dx
+          mov       bl, [si]            ; B
+          shr       bl, 1
+          shr       bl, 1
+          inc       si
+          mov       bh, [si]            ; G
+          shr       bh, 1
+          shr       bh, 1
+          inc       si
+          mov       ah, [si]            ; R
+          shr       ah, 1
+          shr       ah, 1
+          inc       si
+          inc       si                  ; Dummy
+          mov       al, ah              ;R
+          out       dx, al
+          mov       al, bh              ;G
+          out       dx, al
+          mov       al, bl              ;B
+          out       dx, al
+          inc       cl
+          cmp       cl, 16
+          jb        .2
+          ret
+
+; ----------------------------------------------------------------------------
+; If defined, this function will write the current instruction pointer before
+; any operation (used while fixing the 65C02 core).
+; ----------------------------------------------------------------------------
+
+%ifdef    CPUDEBUG
+cpudebug: push      ax
+          push      cx
+          push      dx
+          push      di
+          mov       al, [rip+1]
+          call      wrbyt
+          mov       al, [rip]
+          call      wrbyt
+          mov       di, stra
+          call      wrstrcp
+          mov       al, [ra]
+          call      wrbyt
+          mov       di, strx
+          call      wrstrcp
+          mov       al, [rx]
+          call      wrbyt
+          mov       di, stry
+          call      wrstrcp
+          mov       al, [ry]
+          call      wrbyt
+          mov       di, strs
+          call      wrstrcp
+          mov       al, [rs]
+          call      wrbyt
+          mov       di, strp
+          call      wrstrcp
+          mov       al, [rp]
+          call      wrbyt
+          mov       di, strc
+          call      wrstrcp
+          pop       di
+          pop       dx
+          pop       cx
+          pop       ax
+          ret
+
+stra:     db        "-  A=", 0
+strx:     db        " X=", 0
+stry:     db        " Y=", 0
+strs:     db        " S=", 0
+strp:     db        " P=", 0
+strc:     db        13, 10, 0
+%endif
+
+; ----------------------------------------------------------------------------
+; If defined, this function will dump all memory accesses.
+; ----------------------------------------------------------------------------
+
+%ifdef    MEMDEBUG
+dumpr:    push      ax
+          push      bx
+          push      cx
+          push      dx
+          push      si
+          push      di
+          push      ax        ; I know, I know
+          mov       ax, di
+          xchg      ah, al
+          call      wrbyt
+          mov       ax, di
+          call      wrbyt
+          mov       dl, 'R'
+          mov       ah, iocmd
+          int       0x21
+          pop       ax
+          call      wrbyt
+          mov       di, strc
+          call      wrstrcp
+          pop       di
+          pop       si
+          pop       dx
+          pop       cx
+          pop       bx
+          pop       ax
+          ret
+
+dumpw:    push      ax
+          push      bx
+          push      cx
+          push      dx
+          push      si
+          push      di
+          push      ax        ; I know, I know
+          mov       ax, di
+          xchg      ah, al
+          call      wrbyt
+          mov       ax, di
+          call      wrbyt
+          mov       dl, 'W'
+          mov       ah, iocmd
+          int       0x21
+          pop       ax
+          call      wrbyt
+          mov       di, strc
+          call      wrstrcp
+          pop       di
+          pop       si
+          pop       dx
+          pop       cx
+          pop       bx
+          pop       ax
+          ret
+strc:     db        13, 10, 0
+%endif
+
+; ----------------------------------------------------------------------------
+; Only needed if debugging the core.
+; ----------------------------------------------------------------------------
+
+%ifdef    XTRACODE
+wrbyt:    push      ax
+          mov       ah, al
+          and       al, 0xF0
+          shr       al, 1
+          shr       al, 1
+          shr       al, 1
+          shr       al, 1
+          call      wrnib
+          pop       ax
+          push      ax
+          and       al, 0x0F
+          call      wrnib
+          pop       ax
+          ret
+wrnib:    cmp       al, 10
+          jae       .1
+          or        al, 0x30
+          jmp       .2
+.1:       add       al, 55
+.2:       push      dx
+          push      ax
+          mov       dl, al
+          mov       ah, iocmd
+          int       0x21
+          pop       ax
+          pop       dx
+          ret
+wrstrcp:  push      ax
+          push      dx
+          push      di
+.1:       mov       dl, [di]
+          or        dl, dl
+          jz        .2
+          mov       ah, iocmd
+          int       0x21
+          inc       di
+          jmp short .1
+.2:       pop       di
+          pop       dx
+          pop       ax
+          ret
+%endif
+
+; ----------------------------------------------------------------------------
+; Functions for interfering with normal memory I/O so that hardware can be
+; emulated.
+; ----------------------------------------------------------------------------
+
+preread:  cmp       di, 0xC000
+          jb        .1
+          cmp       di, 0xD000
+          jb        .2
+.1:       clc                           ; Normal read
+          ret
+.2:       cmp       di, 0xC010
+          jb        .3
+          cmp       di, 0xC020
+          jae       .4
+          and       byte [lastkey], 0x7F
+          stc
+          ret
+.3:       mov       al, [lastkey]
+          stc
+          ret
+.4:       cmp       di, 0xC050
+          jb        .5
+          cmp       di, 0xC057
+          ja        .5
+          mov       cx, di
+          and       cl, 0x07
+          call      vmset
+.5:       mov       al, 0x00            ; FF, but 0 matches my M6502.c tracer
+          stc
+          ret                           ; I/O read
+
+postread: 
+%ifdef    MEMDEBUG
+          call      dumpr
+%endif
+          ret
+
+prewrt:   
+%ifdef    MEMDEBUG
+          call      dumpw
+%endif
+          cmp       di, 0xC000          ; Carry set = do not write
+          jae       .1
+          clc
+          ret
+.1:       stc
+          ret
+
+postwrt:  cmp       di, 0x0400
+          jb        .1
+          cmp       di, 0x0800
+          jb        .2
+          cmp       di, 0xC000
+          jb        .1
+          cmp       di, 0xD000
+          jb        .3
+.1:       ret                           ; Normal write
+.2:       jmp       updcon              ; TXT1 write
+.3:       jmp       preread             ; I/O write
+
+; ----------------------------------------------------------------------------
+; Reinitialize video memory (will need to be rewritten if TXT2 or HGR added)
+; ----------------------------------------------------------------------------
+
+vmode:    db        0x00
+vmset:    mov       ch, 0xFF
+          and       cl, 0x07
+          test      cl, 0x01
+          jz        .1
+          xor       ch, ch
+.1:       shr       cl, 1
+          mov       bl, 1
+          shl       bl, cl
+          test      ch, ch
+          jz        .2
+          xor       bl, ch
+          and       [vmode], bl
+          jmp short vidref
+.2:       or        [vmode], bl         ; FALL INTO
+vidref:   mov       di, 0x0400
+.1:       call      updcon
+          inc       di
+          cmp       di, 0x0800
+          jb        .1
+          ret
+
+; ----------------------------------------------------------------------------
+; Called after a write to 0400-07FF, to force a synch to CGA memory.
+; ----------------------------------------------------------------------------
+
+updcon:   push      ax
+          push      bx
+          push      cx
+          push      dx
+          push      di
+          push      si
+          mov       bh, [colmain]
+          mov       bl, es:[di]         ; Convert character
+          cmp       bl, 0x80            ; On=normal
+          jb        .1
+          and       bl, 0x7F
+          cmp       bl, 0x1F            ; 80-9F - translate to 40-5F
+          ja        .3
+          or        bl, 0x40
+          jmp short .3
+.1:       cmp       bl, 0x40            ; Flash
+          jae       .2
+          mov       bh, [colmain+1]     ; 00-3F - Inverse
+          cmp       bl, 0x20            ; 00-1F - translate to 40-5F
+          ja        .3
+          or        bl, 0x40
+          jmp short .3
+.2:       mov       bh, [colmain+1]     ; Flash - degrade to inverse
+          cmp       bl, 0x60            ; 60-7F - translate to 20-3F
+          jb        .3
+          and       bl, 0x3F
+.3:       mov       ax, di
+          and       ax, 0x03FF          ; Flatten address.  (BX=char+attr)
+          mov       dx, ax              ; 128s - lines 0-7
+          mov       cl, 7
+          shr       dx, cl
+          mov       ch, dl              ; CH - line number mod 8
+          mov       dx, ax
+          and       dx, 0x007F
+          cmp       dl, 0x78
+          jb        .4
+          pop       si
+          pop       di
+          pop       dx                  ; Range error
+          pop       cx
+          pop       bx
+          pop       ax
+          ret
+.4:       xor       dh, dh
+.5:       cmp       dl, 40              ; DH = DL/40; DL %= 40
+          jb        .6
+          sub       dl, 40
+          inc       dh
+          jmp short .5
+.6:       push      bx
+          mov       cl, 3               ; DH *= 8
+          shl       dh, cl
+          add       dh, ch              ; DL=column, DH=row
+          test      byte [vmode], 0x01  ; C050/1 - GR
+          jnz       .9
+          cmp       dh, 20              ; Line
+          jb        .7
+          test      byte [vmode], 0x02  ; C052/3 - Split
+          jnz       .9
+.7:       pop       bx
+          mov       bh, es:[di]
+          test      byte [isvga], 0xFF
+          jnz       .8
+          call      xl8colr
+.8:       mov       bl, 0xDF
+          push      bx
+.9:       push      dx
+          mov       al, dh
+          xor       dx, dx              ; AX=rows*40, DX=collateral damage
+          xor       ah, ah
+          xor       bh, bh
+          mov       bl, 40
+          mul       bx
+          pop       bx
+          xor       bh, bh              ; Add columns
+          add       ax, bx
+          shl       ax, 1               ; 2 bytes per char block
+          pop       bx
+          mov       dx, 0xB800          ; CGA text buffer
+          mov       ds, dx
+          mov       si, ax
+          mov       [si], bx            ; Copy both char and attr at once
+          push      cs                  ; Restore DS
+          pop       ds
+          pop       si
+          pop       di
+          pop       dx
+          pop       cx
+          pop       bx
+          pop       ax
+          ret
+
+xl8colr:  push      ax
+          push      cx
+          mov       ax, bx
+          mov       bl, bh
+          and       bl, 0x0F
+          xor       bh, bh
+          mov       al, [colmap+bx]
+          mov       bl, ah
+          mov       cl, 4
+          shr       bl, cl
+          clc
+          mov       ah, [colmap+bx]
+          shl       ah, cl
+          or        al, ah
+          mov       bh, al
+          and       bh, 0x77            ; XXX: kill hi-intensity until I've
+                                        ;      written code to kill blink on
+                                        ;      CGA
+          pop       cx
+          pop       ax
+          ret
+
+; ============================================================================
+; The 65C02 Core
+; ----------------------------------------------------------------------------
+; Several sections of this code appear in two forms, delineated by %ifdefs.
+; The default version (marked by "%else" and "unrolled") uses macros for speed
+; while the OPTSIZE version (also marked "rolled") uses functions for size.
+; The difference in binary size is very significant (the whole size-optimized
+; 65C02 core is less than 4K of x86 code), but CALL and RET are known to be
+; stuck Zaku on any CPU architecture.
+;
+; Relative jumps are implemented as macros on both core variants.
+; ----------------------------------------------------------------------------
+; Only "micro-ops" are actually implemented separately between the two modes.
+; ============================================================================
+
+; ----------------------------------------------------------------------------
+; Opcode JMP table (GTE 65SC02)
+; ----------------------------------------------------------------------------
+
+cputbl:   dw        op00, op01, _nop, _nop, op04, op05, op06, _nop
+          dw        op08, op09, op0A, _nop, op0C, op0D, op0E, _nop
+          dw        op10, op11, op12, _nop, op14, op15, op16, _nop
+          dw        op18, op19, op1A, _nop, op1C, op1D, op1E, _nop
+          dw        op20, op21, _nop, _nop, op24, op25, op26, _nop
+          dw        op28, op29, op2A, _nop, op2C, op2D, op2E, _nop
+          dw        op30, op31, op32, _nop, op34, op35, op36, _nop
+          dw        op38, op39, op3A, _nop, op3C, op3D, op3E, _nop
+          dw        op40, op41, _nop, _nop, _nop, op45, op46, _nop
+          dw        op48, op49, op4A, _nop, op4C, op4D, op4E, _nop
+          dw        op50, op51, op52, _nop, _nop, op55, op56, _nop
+          dw        op58, op59, op5A, _nop, _nop, op5D, op5E, _nop
+          dw        op60, op61, _nop, _nop, op64, op65, op66, _nop
+          dw        op68, op69, op6A, _nop, op6C, op6D, op6E, _nop
+          dw        op70, op71, op72, _nop, op74, op75, op76, _nop
+          dw        op78, op79, op7A, _nop, op7C, op7D, op7E, _nop
+          dw        op80, op81, _nop, _nop, op84, op85, op86, _nop
+          dw        op88, op89, op8A, _nop, op8C, op8D, op8E, _nop
+          dw        op90, op91, op92, _nop, op94, op95, op96, _nop
+          dw        op98, op99, op9A, _nop, op9C, op9D, op9E, _nop
+          dw        opA0, opA1, opA2, _nop, opA4, opA5, opA6, _nop
+          dw        opA8, opA9, opAA, _nop, opAC, opAD, opAE, _nop
+          dw        opB0, opB1, opB2, _nop, opB4, opB5, opB6, _nop
+          dw        opB8, opB9, opBA, _nop, opBC, opBD, opBE, _nop
+          dw        opC0, opC1, _nop, _nop, opC4, opC5, opC6, _nop
+          dw        opC8, opC9, opCA, _nop, opCC, opCD, opCE, _nop
+          dw        opD0, opD1, opD2, _nop, _nop, opD5, opD6, _nop
+          dw        opD8, opD9, opDA, _nop, _nop, opDD, opDE, _nop
+          dw        opE0, opE1, _nop, _nop, opE4, opE5, opE6, _nop
+          dw        opE8, opE9, _nop, _nop, opEC, opED, opEE, _nop
+          dw        opF0, opF1, opF2, _nop, _nop, opF5, opF6, _nop
+          dw        opF8, opF9, opFA, _nop, _nop, opFD, opFE, _nop
+
+; ----------------------------------------------------------------------------
+; If OPTSIZE is defined, use functions to save disk space.
+;
+; See the unrolled version for comments (which gets priority in testing and
+; maintenance).  Also note some unorthodox use of XOR when the state of a bit
+; is known to be on.
+; ----------------------------------------------------------------------------
+
+%ifdef    OPTSIZE
+_rd:      xor       ah, ah
+          call      preread
+          jc        .1
+          mov       al, es:[di]
+.1:       jmp       postread
+
+_wr:      call      prewrt
+          jc        .1
+          mov       es:[di], al
+.1:       jmp       postwrt
+
+_ldby:    mov       di, [rip]
+          call      _rd
+          xor       ah, ah
+          inc       word [rip]
+          ret
+
+_ldwd:    mov       di, [rip]
+          call      _rd
+          mov       bh, al
+          inc       di
+          call      _rd
+          mov       ah, al
+          mov       al, bh
+          inc       di
+          mov       [rip], di
+          ret
+
+_setzn:   and       byte [rp], ~(FLAG_Z | FLAG_N)
+          or        al, al
+          jnz       .1
+          or        byte [rp], FLAG_Z
+          ret
+.1:       test      al, 0x80
+          jz        .2
+          or        byte [rp], FLAG_N
+.2:       ret
+
+_setv:    and       byte [rp], ~FLAG_V
+          test      al, 0x40
+          jz        .1
+          or        byte [rp], FLAG_V
+.1:       ret
+
+_push:    dec       byte [rs]
+          mov       bh, 0x01
+          mov       bl, [rs]
+          mov       di, bx
+          jmp       _wr
+
+_pop:     mov       bh, 0x01
+          mov       bl, [rs]
+          mov       di, bx
+          call      _rd
+          inc       byte [rs]
+          ret
+
+_jr:      mov       di, [rip]
+          call      _rd
+          inc       word [rip]
+          cbw
+          add       word [rip], ax
+          ret
+
+; ----------------------------------------------------------------------------
+; Addressing modes (Rolled version)
+; ----------------------------------------------------------------------------
+
+_imm      equ       _ldby
+
+_abs:     call      _ldwd               ; FALL INTO
+_mvdiax:  mov       di, ax
+          ret
+
+_zp:      mov       di, [rip]
+          call      _rd
+          inc       word [rip]
+          xor       ah, ah
+          jmp short _mvdiax
+
+_zpx:     call      _zp
+          mov       bl, [rx]
+          jmp short _zpxycm
+_zpy:     call      _zp
+          mov       bl, [ry]            ; FALL INTO
+_zpxycm:  xor       bh, bh              ; FALL INTO
+_addibx:  add       di, bx
+          ret
+
+_absx:    call      _abs
+          mov       bl, [rx]
+          jmp short _abxycm
+_absy:    call      _abs
+          mov       bl, [ry]
+_abxycm:  xor       bh, bh              ; FALL INTO
+          jmp short _addibx
+
+_idx:     call      _zp
+          mov       bl, [rx]
+          xor       bh, bh
+          add       ax, bx
+          mov       di, ax
+          call      _rd
+          mov       ah, al
+          inc       di
+          call      _rd
+          xchg      al, ah
+          jmp short _mvdiax
+
+_idz:     call      _zp
+          call      _rd
+          mov       bl, al
+          inc       di
+          call      _rd
+          mov       bh, al
+          mov       di, bx
+          ret
+
+_idy:     call      _idz
+          mov       bl, [ry]
+          xor       bh, bh
+          jmp short _addibx
+
+; ----------------------------------------------------------------------------
+; Operations (Rolled version)
+; ----------------------------------------------------------------------------
+
+_tsb:     and       byte [rp], ~FLAG_Z
+          test      al, [ra]
+          jnz       .1
+          or        byte [rp], FLAG_Z
+.1:       or        ah, [ra]
+          ret
+
+_trb:     call      _tsb
+          xor       al, [ra]
+          ret
+
+_sbc:     xor       al, 0xFF            ; FALL INTO
+_adc:     mov       bl, [ra]
+          xor       ah, ah              ; Create words out of AL and BL
+          xor       bh, bh
+          add       bx, ax
+          test      byte [rp], FLAG_C   ; Add in carry flag, if needed
+          jz        .1
+          inc       bx
+.1:       test      byte [rp], FLAG_D   ; Are we in BCD mode?
+          jz        .3                  ; No, skip.
+          mov       ch, bl
+          and       ch, 0x0F            ; Low nibble only
+          cmp       ch, 0x0A            ; Digit overflows BCD?
+          jb        .2
+          add       bx, 0x06            ; Translate carry
+.2:       mov       ch, bl
+          and       ch, 0xF0            ; High nibble only
+          cmp       ch, 0xA0            ; Digit overflows BCD?
+          jb        .3
+          add       bx, 0x60            ; Translate carry
+.3:       and       byte [rp], ~(FLAG_C|FLAG_V)
+          or        bh, bh              ; Detect a carry condition
+          jz        .4                  ; No, didn't happen
+          or        byte [rp], FLAG_C
+.4:       mov       ah, bl
+          and       ax, 0x8080
+          xor       ah, al
+          jz        .5                  ; No change, skip.
+          or        byte [rp], FLAG_V
+.5:       mov       al, bl
+          mov       [ra], bl
+          jmp       _setzn              ; Set Z+N flags, then we're outtie
+
+_cmp:     mov       ah, [ra]
+          jmp short _cpr
+_cpx:     mov       ah, [rx]
+          jmp short _cpr
+_cpy:     mov       ah, [ry]            ; FALL INTO
+_cpr:     and       byte [rp], ~(FLAG_C | FLAG_Z | FLAG_N)
+          cmp       ah, al
+          jb        .1
+          or        byte [rp], FLAG_C
+.1:       cmp       ah, al
+          jne       .2
+          or        byte [rp], FLAG_Z
+.2:       sub       ah, al
+          test      ah, 0x80
+          jz        .3
+          or        byte [rp], FLAG_N
+.3:       ret
+
+_bit:     and       byte [rp], ~(FLAG_N | FLAG_V | FLAG_Z)
+          mov       ah, al
+          and       al, (FLAG_N | FLAG_V)
+          or        [rp], al
+          and       ah, [ra]
+          jnz       .1
+          or        byte [rp], FLAG_Z
+.1:       jmp       _setv
+
+_and:     and       [ra], al
+          jmp short _aoecm
+_ora:     or        [ra], al
+          jmp short _aoecm
+_eor:     xor       [ra], al            ; FALL INTO
+_aoecm:   mov       al, [ra]
+          jmp       _setzn
+
+_inc:     inc       al
+          jmp       _setzn
+
+_dec:     dec       al
+          jmp       _setzn
+
+_asl:     and       byte [rp], ~FLAG_C
+          test      al, 0x80
+          jz        .1
+          or        byte [rp], FLAG_C
+.1:       shl       al, 1
+          jmp       _setzn
+
+_lsr:     and       byte [rp], ~FLAG_C
+          test      al, 0x01
+          jz        .1
+          or        byte [rp], FLAG_C
+.1:       shr       al, 1
+          jmp       _setzn
+
+_rol:     clc
+          test      byte [rp], FLAG_C
+          jz        .1
+          stc
+.1:       rcl       al, 1
+          jmp short _rotcm
+_ror:     clc
+          test      byte [rp], FLAG_C
+          jz        .1
+          stc
+.1:       rcr       al, 1               ; FALL INTO
+_rotcm:   lahf
+          and       byte [rp], ~FLAG_C
+          test      ah, 0x01            ; x86 carry bit
+          jz        .1
+          or        byte [rp], FLAG_C
+.1:       jmp       _setzn
+
+; ----------------------------------------------------------------------------
+; These are implemented as macros even on the rolled version of the core.
+; ----------------------------------------------------------------------------
+
+%macro    _jrt      1                   ; Jump relative if bit true
+          test      byte [rp], %1
+          jz        %%1
+          _jr
+          ret
+%%1:      inc       word [rip]
+          ret
+%endmacro
+
+%macro    _jrf      1                   ; Jump relative if bit false
+          test      byte [rp], %1
+          jnz       %%1
+          _jr
+          ret
+%%1:      inc       word [rip]
+          ret
+%endmacro
+
+; ----------------------------------------------------------------------------
+; This allows the lion's share of the emulation to be shared between the two
+; versions of the core by emulating macro calls with function calls.
+; ----------------------------------------------------------------------------
+
+%define   _push     call _push
+%define   _pop      call _pop
+%define   _rd       call _rd
+%define   _wr       call _wr
+%define   _imm      call _imm
+%define   _abs      call _abs
+%define   _absx     call _absx
+%define   _absy     call _absy
+%define   _zp       call _zp
+%define   _zpx      call _zpx
+%define   _zpy      call _zpy
+%define   _idx      call _idx
+%define   _idy      call _idy
+%define   _idz      call _idz
+%define   _inc      call _inc
+%define   _dec      call _dec
+%define   _adc      call _adc
+%define   _sbc      call _sbc
+%define   _bit      call _bit
+%define   _cmp      call _cmp
+%define   _cpx      call _cpx
+%define   _cpy      call _cpy
+%define   _and      call _and
+%define   _ora      call _ora
+%define   _eor      call _eor
+%define   _asl      call _asl
+%define   _lsr      call _lsr
+%define   _rol      call _rol
+%define   _ror      call _ror
+%define   _trb      call _trb
+%define   _tsb      call _tsb
+%define   _setzn    call _setzn
+%define   _ldby     call _ldby
+%define   _ldwd     call _ldwd
+%define   _jr       call _jr
+%else
+; ----------------------------------------------------------------------------
+; If OPTSIZE is NOT defined, use macros to avoid unnecessary CALL/RET/JMPs for
+; a speed boost at the cost of a MUCH bigger core.
+; ----------------------------------------------------------------------------
+
+%macro    _rd       0                   ; Read from 65C02 memory
+          xor       ah, ah
+          call      preread
+          jc        %%1
+          mov       al, es:[di]
+%%1:      call      postread
+%endmacro
+
+%macro    _wr       0                   ; Write to 65C02 memory
+          call      prewrt
+          jc        %%1
+          mov       es:[di], al
+%%1:      call      postwrt
+%endmacro
+
+%macro    _ldby     0                   ; Load byte from memory at 65C02 IP
+          mov       di, [rip]
+          _rd
+          xor       ah, ah
+          inc       word [rip]
+%endmacro
+
+%macro    _ldwd     0                   ; Load word from memory at 65C02 IP
+          mov       di, [rip]
+          _rd
+          mov       bh, al
+          inc       di
+          _rd
+          mov       ah, al
+          mov       al, bh
+          inc       di
+          mov       [rip], di
+%endmacro
+
+%macro    _setzn    0                   ; Set ZN flags based on AL
+          and       byte [rp], ~(FLAG_Z | FLAG_N)
+          or        al, al
+          jnz       %%1
+          or        byte [rp], FLAG_Z
+          jmp       %%2
+%%1:      test      al, 0x80
+          jz        %%2
+          or        byte [rp], FLAG_N
+%%2:
+%endmacro
+
+%macro    _setv     0
+          and       byte [rp], ~FLAG_V
+          test      al, 0x40
+          jz        %%1
+          or        byte [rp], FLAG_V
+%%1:      
+%endmacro
+
+%macro    _push     0                   ; Push onto 65C02 stack
+          dec       byte [rs]
+          mov       bh, 0x01
+          mov       bl, [rs]
+          mov       di, bx
+          _wr
+%endmacro
+
+%macro    _pop      0                   ; Pop from 65C02 stack
+          mov       bh, 0x01
+          mov       bl, [rs]
+          mov       di, bx
+          _rd
+          inc       byte [rs]
+%endmacro
+
+%macro    _jr       0                   ; Jump relative
+          mov       di, [rip]
+          _rd
+          inc       word [rip]
+          cbw
+          add       word [rip], ax
+%endmacro
+
+%macro    _jrt      1                   ; Jump relative if bit true
+          test      byte [rp], %1
+          jz        %%1
+          _jr
+          jmp       %%2
+%%1:      inc       word [rip]
+%%2:
+%endmacro
+
+%macro    _jrf      1                   ; Jump relative if bit false
+          test      byte [rp], %1
+          jnz       %%1
+          _jr
+          jmp       %%2
+%%1:      inc       word [rip]
+%%2:
+%endmacro
+
+; ----------------------------------------------------------------------------
+; Addressing modes (Unrolled version)
+; ----------------------------------------------------------------------------
+
+%macro    _imm      0                   ; #$xx (do NOT use _rd with this)
+          _ldby
+%endmacro
+
+%macro    _abs      0                   ; $xxxx
+          _ldwd
+          mov       di, ax
+%endmacro
+
+%macro    _zp       0                   ; $xx
+          mov       di, [rip]
+          _rd
+          inc       word [rip]
+          xor       ah, ah
+          mov       di, ax
+%endmacro
+
+%macro    _zpx      0                   ; $xx, X
+          _zp
+          mov       bl, [rx]
+          xor       bh, bh
+          add       di, bx
+%endmacro
+
+%macro    _zpy      0                   ; $xx, Y
+          _zp
+          mov       bl, [ry]
+          xor       bh, bh
+          add       di, bx
+%endmacro
+
+%macro    _absx     0                   ; $xxxx, X
+          _ldwd
+          mov       di, ax
+          mov       bl, [rx]
+          xor       bh, bh
+          add       di, bx
+%endmacro
+
+%macro    _absy     0                   ; $xxxx, Y
+          _ldwd
+          mov       di, ax
+          mov       bl, [ry]
+          xor       bh, bh
+          add       di, bx
+%endmacro
+
+%macro    _idx      0                   ; ($xx, X)
+          _zp
+          mov       bl, [rx]
+          xor       bh, bh
+          add       ax, bx
+          mov       di, ax
+          _rd
+          mov       ah, al
+          inc       di
+          _rd
+          xchg      al, ah
+          mov       di, ax
+%endmacro
+
+%macro    _idz      0                   ; ($xx)
+          _zp
+          _rd
+          mov       bl, al
+          inc       di
+          _rd
+          mov       bh, al
+          mov       di, bx
+%endmacro
+
+%macro    _idy      0                   ; ($xx), Y
+          _idz                          ; ($xx)
+          mov       bl, [ry]
+          xor       bh, bh
+          add       di, bx
+%endmacro
+
+; ----------------------------------------------------------------------------
+; Operations (Unrolled version)
+; ----------------------------------------------------------------------------
+
+%macro    _tsb      0                   ; Test and set bits
+          and       byte [rp], ~FLAG_Z
+          test      al, [ra]
+          jnz       %%1
+          or        byte [rp], FLAG_Z
+%%1:
+          or        ah, [ra]
+%endmacro
+
+%macro    _trb      0                   ; Test and reset bits
+          _tsb
+          xor       al, [ra]
+%endmacro
+
+%macro    _adc      0                   ; Add with carry
+          mov       bl, [ra]
+          xor       ah, ah              ; Create words out of AL and BL
+          xor       bh, bh
+          add       bx, ax
+          test      byte [rp], FLAG_C   ; Add in carry flag, if needed
+          jz        %%1
+          inc       bx
+%%1:      test      byte [rp], FLAG_D   ; Are we in BCD mode?
+          jz        %%3                 ; No, skip.
+          mov       ch, bl
+          and       ch, 0x0F            ; Low nibble only
+          cmp       ch, 0x0A            ; Digit overflows BCD?
+          jb        %%2
+          add       bx, 0x06            ; Translate carry
+%%2:      mov       ch, bl
+          and       ch, 0xF0            ; High nibble only
+          cmp       ch, 0xA0            ; Digit overflows BCD?
+          jb        %%3
+          add       bx, 0x60            ; Translate carry
+%%3:      and       byte [rp], ~(FLAG_C|FLAG_V)
+          or        bh, bh              ; Detect a carry condition
+          jz        %%4                 ; No, didn't happen
+          or        byte [rp], FLAG_C
+%%4:      mov       ah, bl
+          and       ax, 0x8080
+          xor       ah, al
+          jz        %%5                 ; No change, skip.
+          or        byte [rp], FLAG_V
+%%5:      mov       al, bl
+          mov       [ra], bl
+          _setzn                        ; Set Z+N flags, then we're outtie
+%endmacro
+
+%macro    _sbc      0                   ; Subtract with carry
+          xor       al, 0xFF
+          _adc
+%endmacro
+
+%macro    _cpr      0
+          and       byte [rp], ~(FLAG_C | FLAG_Z | FLAG_N)
+          cmp       ah, al
+          jb        %%1
+          or        byte [rp], FLAG_C
+%%1:      cmp       ah, al
+          jne       %%2
+          or        byte [rp], FLAG_Z
+%%2:      sub       ah, al
+          test      ah, 0x80
+          jz        %%3
+          or        byte [rp], FLAG_N
+%%3:
+%endmacro
+
+%macro    _cmp      0                   ; Compare A
+          mov       ah, [ra]
+          _cpr
+%endmacro
+
+%macro    _cpx      0                   ; Compare X
+          mov       ah, [rx]
+          _cpr
+%endmacro
+
+%macro    _cpy      0                   ; Compare Y
+          mov       ah, [ry]
+          _cpr
+%endmacro
+
+%macro    _bit      0
+          and       byte [rp], ~(FLAG_N | FLAG_V | FLAG_Z)
+          mov       ah, al
+          and       al, (FLAG_N | FLAG_V)
+          or        [rp], al
+          and       ah, [ra]
+          jnz       %%1
+          or        byte [rp], FLAG_Z
+%%1:      _setv
+%endmacro
+
+%macro    _and      0
+          and       [ra], al
+          mov       al, [ra]
+          _setzn
+%endmacro
+
+%macro    _ora      0
+          or        [ra], al
+          mov       al, [ra]
+          _setzn
+%endmacro
+
+%macro    _eor      0                   ; Exclusive OR
+          xor       [ra], al
+          mov       al, [ra]
+          _setzn
+%endmacro
+
+%macro    _inc      0                   ; Increment
+          inc       al
+          _setzn
+%endmacro
+
+%macro    _dec      0                   ; Decrement
+          dec       al
+          _setzn
+%endmacro
+
+%macro    _asl      0                   ; Arithmetic shift left
+          and       byte [rp], ~FLAG_C
+          test      al, 0x80
+          jz        %%1
+          or        byte [rp], FLAG_C
+%%1:      shl       al, 1
+          _setzn
+%endmacro
+
+%macro    _lsr      0                   ; Logical shift right
+          and       byte [rp], ~FLAG_C
+          test      al, 0x01
+          jz        %%1
+          or        byte [rp], FLAG_C
+%%1:      shr       al, 1
+          _setzn
+%endmacro
+
+%macro    _rol      0                   ; Rotate left
+          clc
+          test      byte [rp], FLAG_C
+          jz        %%1
+          stc
+%%1:      rcl       al, 1
+          lahf
+          and       byte [rp], ~FLAG_C
+          test      ah, 0x01            ; x86 carry bit
+          jz        %%2
+          or        byte [rp], FLAG_C
+%%2:      _setzn
+%endmacro
+
+%macro    _ror      0                   ; Rotate right
+          clc
+          test      byte [rp], FLAG_C
+          jz        %%1
+          stc
+%%1:      rcr       al, 1
+          lahf
+          and       byte [rp], ~FLAG_C
+          test      ah, 0x01            ; x86 carry bit
+          jz        %%2
+          or        byte [rp], FLAG_C
+%%2:      _setzn
+%endmacro
+%endif
+
+; ----------------------------------------------------------------------------
+; Thanks to some "call" macros defined in the rolled version of the core, the
+; remainder of the CPU emulation is identical in ASM source.  Different code,
+; however, will be generated.
+; ----------------------------------------------------------------------------
+
+; ----------------------------------------------------------------------------
+; Execute an opcode.  256-entry JMP table.
+; ----------------------------------------------------------------------------
+
+cpustep:  _ldby
+          xor       ah, ah
+          shl       ax, 1
+          mov       bx, ax
+          jmp near  [cputbl+bx]
+
+; ----------------------------------------------------------------------------
+; Opcode code.
+;
+; A lot of this code relies on macros/function calls in such a way that it is
+; incredibly inscrutible.
+; ----------------------------------------------------------------------------
+
+_nop:     ret                           ; Default operation, also $EA
+
+op00:     inc       word [rip]          ; BRK is actually a 2-byte operation.
+          mov       al, [rip+1]
+          _push
+          mov       al, [rip]
+          _push
+          mov       al, [rp]
+          or        al, FLAG_B
+          _push
+          or        byte [rp], FLAG_I
+          and       byte [rp], ~(FLAG_D)
+          mov       di, 0xFFFE          ; IRQ/BRK vector (combined on 8-bit)
+          _rd
+          mov       [rip], al
+          inc       di
+          _rd
+          mov       [rip+1], al
+          ret
+
+op01:     _idx                          ; ORA ($xx, X)
+          _rd
+          _ora
+          ret
+
+op04:     _zp                           ; TSB $xx
+          _rd
+          _tsb
+          _wr
+          ret
+
+op05:     _zp                           ; ORA $xx
+          _rd
+          _ora
+          ret
+
+op06:     _zp                           ; ASL $xx
+          _rd
+          _asl
+          _wr
+          ret
+
+op08:     mov       al, [rp]            ; PHP
+          _push
+          ret
+
+op09:     _imm                          ; ORA #$xx
+          _ora
+          ret
+
+op0A:     mov       al, [ra]            ; ASL
+          _asl
+          mov       [ra], al
+          ret
+
+op0C:     _abs                          ; TSB $xxxx
+          _rd
+          _tsb
+          _wr
+          ret
+
+op0D:     _abs                          ; ORA $xxxx
+          _rd
+          _ora
+          ret
+
+op0E:     _abs                          ; ASL $xxxx
+          _rd
+          _asl
+          _wr
+          ret
+
+op10:     _jrf      FLAG_N              ; BPL $xxxx
+          ret
+
+op11:     _idy                          ; ORA ($xx), Y
+          _rd
+          _ora
+          ret
+
+op12:     _idz                          ; ORA ($xx)
+          _rd
+          _ora
+          ret
+
+op14:     _zp                           ; TRB $xx
+          _rd
+          _trb
+          _wr
+          ret
+
+op15:     _zpx                          ; ORA $xx, X
+          _rd
+          _ora
+          ret
+
+op16:     _zpx                          ; ASL $xx, X
+          _rd
+          _asl
+          _wr
+          ret
+
+op18:     and       byte [rp], ~FLAG_C  ; CLC
+          ret
+
+op19:     _absy                         ; ORA $xxxx, Y
+          _rd
+          _ora
+          ret
+
+op1A:     mov       al, [ra]            ; INC
+          _inc
+          mov       [ra], al
+          ret
+
+op1C:     _abs                          ; TRB $xxxx
+          _rd
+          _trb
+          _wr
+          ret
+
+op1D:     _absx                         ; ORA $xxxx, X
+          _rd
+          _ora
+          ret
+
+op1E:     _absx                         ; ASL $xxxx, X
+          _rd
+          _asl
+          _wr
+          ret
+
+op20:     mov       bx, [rip]           ; JSR $xxxx
+          inc       word bx
+          mov       al, bh
+          push      bx
+          _push
+          pop       bx
+          mov       al, bl
+          _push
+          jmp       op4C
+
+op21:     _idx                          ; AND ($xx, X)
+          _rd
+          _and
+          ret
+
+op24:     _zp                           ; BIT $xx
+          _rd
+          _bit
+          ret
+
+op25:     _zp                           ; AND $xx
+          _rd
+          _and
+          ret
+
+op26:     _zp                           ; ROL $xx
+          _rd
+          _rol
+          _wr
+          ret
+
+op28:     _pop                          ; PLP
+          or        al, FLAG_R|FLAG_B
+          mov       [rp], al
+          ret
+
+op29:     _imm                          ; AND #$xx
+          _and
+          ret
+
+op2A:     mov       al, [ra]            ; ROL
+          _rol
+          mov       [ra], al
+          ret
+
+op2C:     _abs                          ; BIT $xxxx
+          _rd
+          _bit
+          ret
+
+op2D:     _abs                          ; AND $xxxx
+          _rd
+          _and
+          ret
+
+op2E:     _abs                          ; ROL $xxxx
+          _rd
+          _rol
+          _wr
+          ret
+
+op30:     _jrt      FLAG_N              ; BMI $xxxx
+          ret
+
+op31:     _idy                          ; AND ($xx), Y
+          _rd
+          _and
+          ret
+
+op32:     _idz                          ; AND ($xx)
+          _rd
+          _and
+          ret
+
+op34:     _zpx                          ; BIT $xx, X
+          _rd
+          _bit
+          ret
+
+op35:     _zpx                          ; AND $xx, X
+          _rd
+          _and
+          ret
+          
+op36:     _zpx                          ; ROL $xx, X
+          _rd
+          _rol
+          _wr
+          ret
+
+op38:     or        byte [rp], FLAG_C   ; SEC
+          ret
+
+op39:     _absy                         ; AND $xxxx, Y
+          _rd
+          _and
+          ret
+
+op3A:     mov       al, [ra]            ; DEC
+          _dec
+          mov       [ra], al
+          ret
+
+op3C:     _absx                         ; BIT $xxxx, X
+          _rd
+          _bit
+          ret
+
+op3D:     _absx                         ; AND $xxxx, X
+          _rd
+          _bit
+          ret
+
+op3E:     _absx                         ; ROL $xxxx, X
+          _rd
+          _rol
+          _wr
+          ret
+
+op40:     _pop                          ; RTI
+          or        al, FLAG_R
+          mov       [rp], al
+          _pop
+          mov       [rip], al
+          _pop
+          mov       [rip+1], al
+          ret
+
+op41:     _idx                          ; EOR ($xx, X)
+          _rd
+          _eor
+          ret
+
+op45:     _zp                           ; EOR $xx
+          _rd
+          _eor
+          ret
+
+op46:     _zp                           ; LSR $xx
+          _rd
+          _lsr
+          _wr
+          ret
+
+op48:     mov       al, [ra]            ; PHA
+          _push
+          ret
+
+op49:     _imm                          ; EOR #$xx
+          _eor
+          ret
+
+op4A:     mov       al, [ra]            ; LSR
+          _lsr
+          mov       [ra], al
+          ret
+
+op4C:     _ldwd                         ; JMP $xxxx (also used by JSR)
+          mov       [rip], ax
+          ret
+
+op4D:     _abs                          ; EOR $xxxx
+          _rd
+          _eor
+          ret
+
+op4E:     _abs                          ; LSR $xxxx
+          _rd
+          _lsr
+          _wr
+          ret
+
+op50:     _jrf      FLAG_V              ; BVC
+          ret
+
+op51:     _idy                          ; EOR ($xx), Y
+          _rd
+          _eor
+          ret
+          
+op52:     _idz                          ; EOR ($xx)
+          _rd
+          _eor
+          ret
+          
+op55:     _zpx                          ; EOR $xx, X
+          _rd
+          _eor
+          ret
+          
+op56:     _zpx                          ; LSR $xx, X
+          _rd
+          _lsr
+          _wr
+          ret
+
+op58:     and       byte [rp], ~FLAG_I  ; CLI
+          ret
+
+op59:     _absy                         ; EOR $xxxx, Y
+          _rd
+          _eor
+          ret
+          
+op5A:     mov       al, [ry]            ; PHY
+          _push
+          ret
+          
+op5D:     _absx                         ; EOR $xxxx, X
+          _rd
+          _eor
+          ret
+          
+op5E:     _absx                         ; LSR $xxxx, X
+          _rd
+          _lsr
+          _wr
+          ret
+
+op60:     _pop                          ; RTS
+          mov       [rip], al
+          _pop
+          mov       [rip+1], al
+          inc       word [rip]
+          ret
+
+op61:     _idx                          ; ADC ($xx, X)
+          _rd
+          _adc
+          ret
+
+op64:     _zp                           ; STZ $xx
+          xor       al, al
+          _wr
+          ret
+
+op65:     _zp                           ; ADC $xx
+          _rd
+          _adc
+          ret
+
+op66:     _zp                           ; ROR $xx
+          _rd
+          _ror
+          _wr
+          ret
+
+op68:     _pop                          ; PLA
+          mov       [ra], al
+          _setzn
+          ret
+
+op69:     _imm                          ; ADC #$xx
+          _adc
+          ret
+
+op6A:     mov       al, [ra]            ; ROR
+          _ror
+          mov       [ra], al
+          ret
+
+op6C:     _ldwd                         ; JMP ($xxxx)
+          mov       di, ax
+          _rd
+          mov       [rip], al
+          inc       di
+          _rd
+          mov       [rip+1], al
+          ret
+
+op6D:     _abs                          ; ADC $xxxx
+          _rd
+          _adc
+          ret
+
+op6E:     _abs                          ; ROR $xxxx
+          _rd
+          _ror
+          _wr
+          ret
+
+op70:     _jrt      FLAG_V              ; BVS $xxxx
+          ret
+          
+op71:     _idy                          ; ADC ($xx), Y
+          _rd
+          _adc
+          ret
+
+op72:     _idz                          ; ADC ($xx)
+          _rd
+          _adc
+          ret
+
+op74:     _zpx                          ; STZ $xx, X
+          xor       al, al
+          _wr
+          ret
+
+op75:     _zpx                          ; ADC $xx, X
+          _rd
+          _adc
+          ret
+
+op76:     _zpx                          ; ROR $xx, X
+          _rd
+          _ror
+          _wr
+          ret
+
+op78:     or        byte [rp], FLAG_I   ; SEI
+          ret
+
+op79:     _absy                         ; ADC $xxxx, Y
+          _rd
+          _adc
+          ret
+
+op7A:     _pop                          ; PLY
+          _setzn
+          mov       [ry], al
+          ret
+
+op7C:     _ldwd                         ; JMP ($xxxx, X)
+          mov       di, ax
+          mov       al, [rx]
+          xor       ah, ah
+          add       di, ax
+          _rd
+          mov       [rip], al
+          inc       di
+          _rd
+          mov       [rip+1], al
+          ret
+
+op7D:     _absx                         ; ADC $xxxx, X
+          _rd
+          _adc
+          ret
+
+op7E:     _absx                         ; ROR $xxxx, X
+          _rd
+          _ror
+          _wr
+          ret
+
+op80:     _jr                           ; BRA $xxxx
+          ret
+
+op81:     _idx                          ; STA ($xx, X)
+          mov       al, [ra]
+          _wr
+          ret
+
+op84:     _zp                           ; STY $xx
+          mov       al, [ry]
+          _wr
+          ret
+
+op85:     _zp                           ; STA $xx
+          mov       al, [ra]
+          _wr
+          ret
+          
+op86:     _zp                           ; STX $xx
+          mov       al, [rx]
+          _wr
+          ret
+          
+op88:     mov       al, [ry]            ; DEY
+          _dec
+          mov       [ry], al
+          _setzn
+          ret
+
+op89:     _imm                          ; BIT #$xx
+          _bit
+          ret
+
+op8A:     mov       al, [rx]            ; TXA
+          mov       [ra], al
+          _setzn
+          ret
+
+op8C:     _abs                          ; STY $xxxx
+          mov       al, [ry]
+          _wr
+          ret
+
+op8D:     _abs                          ; STA $xxxx
+          mov       al, [ra]
+          _wr
+          ret
+
+op8E:     _abs                          ; STX $xxxx
+          mov       al, [rx]
+          _wr
+          ret
+
+op90:     _jrf      FLAG_C              ; BCC $xxxx
+          ret
+          
+op91:     _idy                          ; STA ($xx), Y
+          mov       al, [ra]
+          _wr
+          ret
+          
+op92:     _idz                          ; STA ($xx)
+          mov       al, [ra]
+          _wr
+          ret
+
+op94:     _zpx                          ; STY $xx, X
+          mov       al, [ry]
+          _wr
+          ret
+
+op95:     _zpx                          ; STA $xx, X
+          mov       al, [ra]
+          _wr
+          ret
+
+op96:     _idz                          ; STX $xx, Y
+          mov       al, [rx]
+          _wr
+          ret
+
+op98:     mov       al, [ry]            ; TYA
+          mov       [ra], al
+          _setzn
+          ret
+
+op99:     _absy                         ; STA $xxxx, Y
+          mov       al, [ra]
+          _wr
+          ret
+
+op9A:     mov       al, [rx]            ; TXS
+          mov       [rs], al
+          ret
+
+op9C:     _abs                          ; STZ $xxxx
+          xor       al, al
+          _wr
+          ret
+
+op9D:     _absx                         ; STA $xxxx, X
+          mov       al, [ra]
+          _wr
+          ret
+
+op9E:     _absx                         ; STZ $xxxx, X
+          xor       al, al
+          _wr
+          ret
+
+opA0:     _imm                          ; LDY #$xx
+          mov       [ry], al
+          _setzn
+          ret
+
+opA1:     _idx                          ; LDA ($xx, X)
+          _rd
+          mov       [ra], al
+          _setzn
+          ret
+
+opA2:     _imm                          ; LDX #$xx
+          mov       [rx], al
+          _setzn
+          ret
+
+opA4:     _zp                           ; LDY $xx
+          _rd
+          mov       [ry], al
+          _setzn
+          ret
+
+opA5:     _zp                           ; LDA $xx
+          _rd
+          mov       [ra], al
+          _setzn
+          ret
+
+opA6:     _zp                           ; LDX $xx
+          _rd
+          mov       [rx], al
+          _setzn
+          ret
+
+opA8:     mov       al, [ra]            ; TAY
+          mov       [ry], al
+          _setzn
+          ret
+
+opA9:     _imm                          ; LDA #$xx
+          mov       [ra], al
+          _setzn
+          ret
+
+opAA:     mov       al, [ra]            ; TAX
+          mov       [rx], al
+          _setzn
+          ret
+
+opAC:     _abs                          ; LDY $xxxx
+          _rd
+          mov       [ry], al
+          _setzn
+          ret
+
+opAD:     _abs                          ; LDA $xxxx
+          _rd
+          mov       [ra], al
+          _setzn
+          ret
+
+opAE:     _abs                          ; LDX $xxxx
+          _rd
+          mov       [rx], al
+          _setzn
+          ret
+
+opB0:     _jrt      FLAG_C              ; BCS $xxxx
+          ret
+          
+opB1:     _idy                          ; LDA ($xx), Y
+          _rd
+          mov       [ra], al
+          _setzn
+          ret
+
+opB2:     _idz                          ; LDA ($xx)
+          _rd
+          mov       [ra], al
+          _setzn
+          ret
+
+opB4:     _zpx                          ; LDY $xx, X
+          _rd
+          mov       [ry], al
+          _setzn
+          ret
+
+opB5:     _zpx                          ; LDY $xx, X
+          _rd
+          mov       [ra], al
+          _setzn
+          ret
+
+opB6:     _zpy                          ; LDX $xx, Y
+          _rd
+          mov       [rx], al
+          _setzn
+          ret
+
+opB8:     and       byte [rp], ~FLAG_V  ; CLV
+          ret
+
+opB9:     _absy                         ; LDA $xxxx, Y
+          _rd
+          mov       [ra], al
+          _setzn
+          ret
+
+opBA:     mov       al, [rs]             ; TSX
+          mov       [rx], al
+          _setzn
+          ret
+
+opBC:     _absx                         ; LDY $xxxx, X
+          _rd
+          mov       [ry], al
+          _setzn
+          ret
+
+opBD:     _absx                         ; LDA $xxxx, X
+          _rd
+          mov       [ra], al
+          _setzn
+          ret
+
+opBE:     _absy                         ; LDX $xxxx, Y
+          _rd
+          mov       [rx], al
+          _setzn
+          ret
+
+opC0:     _imm                          ; CPY #$xx
+          _cpy
+          ret
+
+opC1:     _idx                          ; CMP ($xx, X)
+          _rd
+          _cmp
+          ret
+
+opC4:     _zp                           ; CPY $xx
+          _rd
+          _cpy
+          ret
+
+opC5:     _zp                           ; CMP $xx
+          _rd
+          _cmp
+          ret
+
+opC6:     _zp                           ; DEC $xx
+          _rd
+          _dec
+          _wr
+          ret
+
+opC8:     mov       al, [ry]            ; INY
+          _inc
+          mov       [ry], al
+          _setzn
+          ret
+
+opC9:     _imm                          ; CMP #$xx
+          _cmp
+          ret
+
+opCA:     mov       al, [rx]            ; DEX
+          _dec
+          mov       [rx], al
+          _setzn
+          ret
+     
+opCC:     _abs                          ; CPY $xxxx
+          _rd
+          _cpy
+          ret
+
+opCD:     _abs                          ; CMP $xxxx
+          _rd
+          _cmp
+          ret
+
+opCE:     _abs                          ; DEC $xxxx
+          _rd
+          _dec
+          _wr
+          ret
+
+opD0:     _jrf      FLAG_Z              ; BNE $xxxx
+          ret
+
+opD1:     _idy                          ; CMP ($xx), Y
+          _rd
+          _cmp
+          ret
+
+opD2:     _idz                          ; CMP ($xx)
+          _rd
+          _cmp
+          ret
+
+opD5:     _zpx                          ; CMP $xx, X
+          _rd
+          _cmp
+          ret
+
+opD6:     _zpx                          ; DEC $xx, X
+          _rd
+          _dec
+          _wr
+          ret
+
+opD8:     and       byte [rp], ~FLAG_D  ; CLD
+          ret
+
+opD9:     _absy                         ; CMP $xxxx, Y
+          _rd
+          _cmp
+          ret
+
+opDA:     mov       al, [rx]            ; PHX
+          _push
+          ret
+
+opDD:     _absx                         ; CMP $xxxx, X
+          _rd
+          _cmp
+          ret
+
+opDE:     _absx                         ; DEC $xxxx, X
+          _rd
+          _dec
+          _wr
+          ret
+
+opE0:     _imm                          ; CPX #$xx
+          _cpx
+          ret
+
+opE1:     _idx                          ; SBC ($xx, X)
+          _rd
+          _sbc
+          ret
+
+opE4:     _zp                           ; CPX $xx
+          _rd
+          _cpx
+          ret
+
+opE5:     _zp                           ; SBC $xx
+          _rd
+          _sbc
+          ret
+
+opE6:     _zp                           ; INC $xx
+          _rd
+          _inc
+          _wr
+          ret
+
+opE8:     mov       al, [rx]            ; INX
+          _inc
+          mov       [rx], al
+          _setzn
+          ret
+
+opE9:     _imm                          ; SBC #$xx
+          _sbc
+          ret
+
+; $EA (NOP) is "implemented" at the top.
+
+opEC:     _abs                          ; CPX $xxxx
+          _rd
+          _cpx
+          ret
+
+opED:     _abs                          ; SBC $xxxx
+          _rd
+          _sbc
+          ret
+
+opEE:     _abs                          ; INC $xxxx
+          _rd
+          _inc
+          _wr
+          ret
+
+opF0:     _jrt      FLAG_Z              ; BEQ $xxxx
+          ret
+
+opF1:     _idy                          ; SBC ($xx), Y
+          _rd
+          _sbc
+          ret
+
+opF2:     _idz                          ; SBC ($xx)
+          _rd
+          _sbc
+          ret
+
+opF5:     _zpx                          ; SBC $xx, X
+          _rd
+          _sbc
+          ret
+
+opF6:     _zpx                          ; INC $xx, X
+          _rd
+          _inc
+          _wr
+          ret
+
+opF8:     or        byte [rp], FLAG_D   ; SED
+          ret
+
+opF9:     _absy                         ; SBC $xxxx, Y
+          _rd
+          _sbc
+          ret
+
+opFA:     _pop                          ; PLX
+          mov       [rx], al
+          _setzn
+          ret
+
+opFD:     _absx                         ; SBC $xxxx, X
+          _rd
+          _sbc
+          ret
+
+opFE:     _absx                         ; INC $xxxx, X
+          _rd
+          _inc
+          _wr
+          ret
+
+; ----------------------------------------------------------------------------
+; Other CPU functions
+; ----------------------------------------------------------------------------
+
+cpureset: mov       di, 0xFFFC          ; Reset vector
+          _rd
+          mov       [rip], al           ; Set 65C02 IP accordingly.
+          inc       di
+          _rd
+          mov       [rip+1], al
+          xor       ax, ax              ; Zot all registers.
+          mov       word [ra], ax
+          mov       word [ry], ax
+          dec       byte [rs]
+          mov       byte [rp], FLAG_Z | FLAG_R
+          ret
+
+; ============================================================================
+; Constant strings
+; ============================================================================
+
+romfile:  db        "APPLE.ROM", 0
+statmsg:  db        "  <F9=Reset 65C02>   <F10=Exit to DOS>  ", 0
+
+; ============================================================================
+; Error messages
+; ============================================================================
+
+edos1:    db        "Incorrect DOS version$"
+eram:     db        "Insufficient memory$"
+erom:     db        "Cannot read APPLE.ROM$"
+esize:    db        "Invalid ROM size$"
+
+; ============================================================================
+; Color data
+; ============================================================================
+
+colmap:   db        0x00, 0x04, 0x01, 0x03, 0x02, 0x07, 0x09, 0x05
+          db        0x0D, 0x06, 0x08, 0x0C, 0x0A, 0x0E, 0x0B, 0x0F
+
+vgamap:   dd        0x00000000, 0x00DD0033, 0x00000099, 0x00DD22DD
+          dd        0x00007722, 0x00555555, 0x002222FF, 0x0066AAFF
+          dd        0x00885500, 0x00FF6600, 0x00AAAAAA, 0x00FF9988
+          dd        0x0011DD00, 0x00FFFF00, 0x0044FF99, 0x00FFFFFF
+
+isvga:    db        0x00
+colmain:  dw        0x7007
+statmain: db        0x5F
+
+; ============================================================================
+; Internal variables
+; ============================================================================
+
+%ifdef    NOBSS
+emuseg:   dw        0x0000
+lastkey:  db        0x00
+%else
+emuseg:
+lastkey   equ       emuseg+2
+%endif
+
+; ============================================================================
+; 65C02 registers.  Placed here so that if BSS is enabled, they do not take
+; space in the binary.  (This makes debugging harder)
+; ============================================================================
+
+%ifdef    NOBSS
+rip:      dw        0x0000              ; Instruction pointer
+ra:       db        0x00                ; Accumulator
+rx:       db        0x00                ; Index register X
+ry:       db        0x00                ; Index register Y
+rs:       db        0x00                ; Stack pointer (low byte only)
+rp:       db        0x00                ; Processor status byte
+%else
+rip       equ       lastkey+1
+ra        equ       rip+2
+rx        equ       ra+1
+ry        equ       rx+1
+rs        equ       ry+1
+rp        equ       rs+1
+%endif
+
+; ============================================================================
+; Stack (follows memory image)
+; ============================================================================
+
+%ifdef    NOBSS
+comstack:
+%else
+comstack  equ       rp+1
+%endif
+
+; ============================================================================
+; Used to mark end of program when reallocating memory at startup
+; ============================================================================
+
+tail      equ       comstack+stksiz
