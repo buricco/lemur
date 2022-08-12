@@ -49,6 +49,8 @@
 ;             debugging the CPU core; will be removed)
 ; -DOPTSIZE:  Builds an alternative version of the CPU core that does not
 ;             unroll most operations; slower but significantly smaller.
+; -DNOVGA:    Disables most of the VGA-specific code, leaving only blink vs.
+;             high intensity support.
 ;
 ; Note that testing is generally done with NOBSS and OPTSIZE switched OFF.
 ; ============================================================================
@@ -181,7 +183,8 @@ entry:    mov       ah, 0x30            ; DOS version
           mov       cx, 0x2000          ;   video mode, so set that.  CH=20
           int       0x10                ;   should hide the cursor.
 
-          call      vgasetup
+          call      vgasetup            ; (Note that with NOVGA, this still
+                                        ;  exists; it is simply crippled.)
           mov       ah, [statmain]      ; White on magenta
           mov       si, statmsg         ; Copy status bar
           mov       di, 0x0780
@@ -283,6 +286,22 @@ cpuloop:
 ; Initialize a VGA, if found.
 ; ----------------------------------------------------------------------------
 
+%ifdef   NOVGA                          ; Still includes VGA "blink disable"
+vgasetup: mov       byte [statmain], 0x5F
+          mov       word [colmain], 0x7007
+          mov       byte [grchr], 0xDF
+          mov       ax, 0x1A00          ; VGA?
+          int       0x10
+          cmp       al, 0x1A
+          je        .1
+          mov       byte [isvga], 0x00
+          ret
+.1:       mov       ax, 0x1003          ; Disable blink
+          xor       bx, bx
+          int       0x10
+          mov       byte [isvga], 0x80
+          ret
+%else
 vgasetup: mov       ax, 0x1A00          ; VGA?
           int       0x10
           cmp       al, 0x1A
@@ -359,6 +378,7 @@ loadfont: push      es                  ; Load a nicer-looking font on VGA.
           pop       bp
           pop       es
           ret
+%endif
 
 ; ----------------------------------------------------------------------------
 ; If defined, this function will write the current instruction pointer before
@@ -659,7 +679,10 @@ updcon:   push      ax
           sub       dl, 40
           inc       dh
           jmp short .5
-.6:       or        bl, [isvga]
+.6:       
+%ifndef   NOVGA
+          or        bl, [isvga]
+%endif
           push      bx
           mov       cl, 3               ; DH *= 8
           shl       dh, cl
@@ -672,9 +695,11 @@ updcon:   push      ax
           jnz       .9
 .7:       pop       bx
           mov       bh, es:[di]
+%ifndef   NOVGA
           test      byte [isvga], 0xFF
           jnz       .8
           call      xl8colr
+%endif
 .8:       mov       bl, [grchr]
           push      bx
 .9:       push      dx
@@ -718,12 +743,14 @@ xl8colr:  push      ax
           shl       ah, cl
           or        al, ah
           mov       bh, al
+          test      byte [isvga], 0xFF
+          jnz       .1
           and       bh, 0x77            ; XXX: kill hi-intensity until I've
                                         ;      written code to kill blink on
                                         ;      CGA
           pop       cx
           pop       ax
-          ret
+.1:       ret
 
 ; ============================================================================
 ; The 65C02 Core
@@ -2447,12 +2474,14 @@ esize:    db        "Invalid ROM size$"
 colmap:   db        0x00, 0x04, 0x01, 0x03, 0x02, 0x07, 0x09, 0x05
           db        0x0D, 0x06, 0x08, 0x0C, 0x0A, 0x0E, 0x0B, 0x0F
 
+%ifndef   NOVGA
 vgamap:   dd        0x00000000, 0x00DD0033, 0x00000099, 0x00DD22DD
           dd        0x00007722, 0x00555555, 0x002222FF, 0x0066AAFF
           dd        0x00885500, 0x00FF6600, 0x00AAAAAA, 0x00FF9988
           dd        0x0011DD00, 0x00FFFF00, 0x0044FF99, 0x00FFFFFF
+%endif
 
-isvga:    db        0x00
+isvga:    db        0x00                ; With NOVGA, only used for blinking
 grchr:    db        0xDF
 colmain:  dw        0x7007
 statmain: db        0x5F
@@ -2475,6 +2504,7 @@ statmain: db        0x5F
 ; when NOBSS is defined)
 ; ============================================================================
 
+%ifndef   NOVGA
 %ifdef    NOBSS
 vgafont:  db        0x08, 0x08, 0x10, 0x10, 0x6C, 0x6C, 0xFE, 0xFE
           db        0xFC, 0xFC, 0xFC, 0xFC, 0x7E, 0x7E, 0x6C, 0x6C
@@ -2862,6 +2892,7 @@ vgafont:  db        0x08, 0x10, 0x6C, 0xFE, 0xFC, 0xFC, 0x7E, 0x6C
           db        0x76, 0xDC, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
           db        0x00, 0x54, 0x28, 0x54, 0x28, 0x54, 0x00, 0x00
 %endif
+%endif
 
 ; ============================================================================
 ; Internal variables
@@ -2871,7 +2902,11 @@ vgafont:  db        0x08, 0x10, 0x6C, 0xFE, 0xFC, 0xFC, 0x7E, 0x6C
 emuseg:   dw        0x0000
 lastkey:  db        0x00
 %else
+%ifdef   NOVGA
+emuseg:
+%else
 emuseg    equ       vgafont+2048
+%endif
 lastkey   equ       emuseg+2
 %endif
 
