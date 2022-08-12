@@ -956,7 +956,7 @@ _adc:     mov       bl, [ra]
           mov       ah, bl
           and       ah, 0x80
           xor       ah, al
-          jz        .5                  ; Output is the same sign: skip.
+          jnz       .5                  ; Output not the same sign: skip.
           and       byte [rp], ~FLAG_V
 .5:       mov       al, bl
           mov       [ra], bl
@@ -1331,7 +1331,7 @@ _rotcm:   lahf
           mov       ah, bl
           and       ah, 0x80
           xor       ah, al
-          jz        %%5                 ; Output is the same sign: skip.
+          jnz       %%5                 ; Output not the same sign: skip.
           and       byte [rp], ~FLAG_V
 %%5:      mov       al, bl
           mov       [ra], bl
